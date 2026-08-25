@@ -31,3 +31,5 @@ python -m sglang.test.run_eval \
     --max-tokens 1024 \
     --chat-template-kwargs '{"enable_thinking": false}' \
     --port 8234
+
+pip install "sgl-eval@git+https://github.com/sgl-project/sgl-eval.git@6690895609dcbc5df1e7b00dd57c9502b868ec4d"
