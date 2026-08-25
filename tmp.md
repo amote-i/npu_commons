@@ -1,109 +1,33 @@
-# full-4-npu-a3 Suite 用例清单
+python -m sglang.test.run_eval \
+    --eval-name gsm8k \
+    --api completion \
+    --max-tokens 512 \
+    --temperature 0 \
+    --port 8234 \
+    --num-examples 200
 
-## NPU4卡用例
+python -m sglang.test.run_eval \
+    --eval-name mmlu \
+    --api chat \
+    --max-tokens 1024 \
+    --temperature 0 \
+    --chat-template-kwargs '{"enable_thinking": false}' \
+    --port 8234 \
+    --num-examples 500
 
-test_npu_config.py
-test_npu_prefetch_checkpoints_multi_npu.py
-test_npu_weight_loader_prefetch.py
-test_npu_debug_tensor_dumps.py
-test_npu_dp_attention.py
-test_npu_disaggregated_vlm.py
-test_npu_epd_dynamic_register.py
-test_npu_enable_quant_communications.py
-test_npu_forward_hooks.py
-test_npu_hicache_mla.py
-test_npu_mm_attention_backend.py
-test_npu_qwen3_next_models.py
-test_npu_prefill_delayer_buckets.py
-test_npu_mm_limit.py
-test_npu_attn_tp_gather_fuseep.py
-test_npu_enable_custom_logit_processor.py
-test_npu_keep_mm_feature_on_device.py
-test_npu_deepep_dispatcher_output_dtype.py
-test_npu_enable_waterfill.py
-test_npu_dynamic_batch_tokenizer_params.py
-test_npu_warmups.py
-test_npu_pp_single_node_extra.py
-test_npu_w4a4_quantization.py
-test_npu_enable_fp32_lm_head.py
-test_npu_moe_rl_weight_updates_from_distributed.py
-test_npu_multi_instance_release_memory_occupation.py
-test_npu_gpu_id.py
-test_npu_mla_w8a8int8.py
-test_npu_tp4_bf16.py
-test_npu_skip_dp_mlp_sync.py
-test_npu_speculative_attention_mode.py
-test_npu_speculative_multi_npu.py
-test_npu_speculative_token_map.py
-test_npu_llama4_scount_17b_16e.py
-test_npu_qwen3_30b_attn_cp.py
-test_npu_qwen3_32b.py
-test_npu_qwen3_next_80b.py
-test_npu_internlm2_7b_reward.py
-test_npu_qwen2_5_1_5b_apeach.py
-test_npu_qwen2_5_math_rm_72b.py
-test_npu_deepseek_vl2.py
-test_npu_encoder_dp.py
-test_npu_gemma_3_4b_it.py
-test_npu_janus_pro_1b.py
-test_npu_janus_pro_7b.py
-test_npu_kimi_vl_a3b_instruct.py
-test_npu_llava_next_72b.py
-test_npu_llava_v1_6_34b.py
-test_npu_mimo_vl_7b_rl.py
-test_npu_minicpm_o_2_6.py
-test_npu_minicpm_v_2_6.py
-test_npu_mistral_small_3_1_24b_instruct_2503.py
-test_npu_phi4_multimodal_instruct.py
-test_npu_qwen2_5_vl_3b_instruct.py
-test_npu_qwen3_vl_30b_a3b_instruct.py
-test_npu_qwen3_vl_4b_instruct.py
-test_npu_qwen3_vl_8b_instruct.py
-test_npu_token_id_retokenize_e2e.py
-test_npu_vision_chunked_prefill.py
+python -m sglang.test.run_eval \
+    --eval-name humaneval \
+    --api chat \
+    --temperature 0 \
+    --max-tokens 1024 \
+    --chat-template-kwargs '{"enable_thinking": false}' \
+    --port 8234 \
+    --num-examples 50
 
-## 4卡用例涉及模型
-
-Qwen/Qwen3-32B
-Qwen/Qwen3-8B
-Qwen/Qwen3-0.6B
-Qwen/Qwen3-30B-A3B
-Qwen/Qwen3-30B-A3B-Instruct-2507
-Qwen/Qwen3-Next-80B-A3B-Instruct
-Qwen/Qwen3.5-35B-A3B
-Qwen/Qwen3.6-35B-A3B
-Eco-Tech/Qwen3.5-35B-A3B-w8a8-mtp
-Eco-Tech/Qwen3-32B-w4a4-LAOS
-vllm-ascend/DeepSeek-V2-Lite-W8A8
-LLM-Research/Llama-3.2-1B-Instruct
-LLM-Research/Llama-3.2-1B
-LLM-Research/Meta-Llama-3-8B-Instruct
-meta-llama/Llama-4-Scout-17B-16E-Instruct
-lmsys/sglang-EAGLE-LLaMA3-Instruct-8B
-Qwen/Qwen3-8B_eagle3
-Zjcxy-SmartAI/Eagle3-Qwen3-32B-zh
-aleoyang/Qwen3-32B-w8a8-MindIE
-google/gemma-3-4b-it
-microsoft/Phi-4-multimodal-instruct
-openbmb/MiniCPM-o-2_6
-openbmb/MiniCPM-V-2_6
-deepseek-ai/deepseek-vl2
-deepseek-ai/Janus-Pro-1B
-deepseek-ai/Janus-Pro-7B
-moonshotai/Kimi-VL-A3B-Instruct
-lmms-lab/llava-next-72b
-lmms-lab/llava-onevision-qwen2-7b-ov
-AI-ModelScope/llava-v1.6-34b
-XiaomiMiMo/MiMo-VL-7B-RL
-mistralai/Mistral-Small-3.1-24B-Instruct-2503
-Qwen/Qwen2.5-VL-3B-Instruct
-Qwen/Qwen2.5-VL-72B-Instruct
-Qwen/Qwen3-VL-4B-Instruct
-Qwen/Qwen3-VL-8B-Instruct
-Qwen/Qwen3-VL-8B-Thinking
-Qwen/Qwen3-VL-30B-A3B-Instruct
-Shanghai_AI_Laboratory/internlm2-7b-reward
-Howeee/Qwen2.5-1.5B-apeach
-Qwen/Qwen2.5-Math-RM-72B
-
---ending
+python -m sglang.test.run_eval \
+    --eval-name humaneval \
+    --api chat \
+    --temperature 0.8 \
+    --max-tokens 1024 \
+    --chat-template-kwargs '{"enable_thinking": false}' \
+    --port 8234
