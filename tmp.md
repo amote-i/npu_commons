@@ -132,6 +132,20 @@ def _debug_log_launch(
     chunk_indices,
 ):
     cu = cu_seqlens.tolist() if cu_seqlens is not None else None
+    stats = []
+    for name, t in (
+        ("k", k),
+        ("v", v),
+        ("beta", beta),
+        ("g", g_cumsum),
+        ("A", A),
+    ):
+        # NOTE: forces a device sync per tensor; debug only. The kernel applies
+        # tl.exp(g) directly, so g's abs-max matters (fp32 exp overflows >~88).
+        nan = int(torch.isnan(t).sum().item())
+        inf = int(torch.isinf(t).sum().item())
+        amax = float(t.abs().amax().item())
+        stats.append(f"{name} nan={nan} inf={inf} amax={amax:.3g}")
     ci = None
     if chunk_indices is not None:
         ci_flat = chunk_indices.flatten().tolist()
@@ -149,7 +163,7 @@ def _debug_log_launch(
         f"A={tuple(A.shape)}x{tuple(A.stride())} "
         f"beta={tuple(beta.shape)}x{tuple(beta.stride())} "
         f"g={tuple(g_cumsum.shape)}x{tuple(g_cumsum.stride())} "
-        f"dev={k.device} warps=4 stages=3",
+        f"dev={k.device} warps=4 stages=3 | inputs: {'; '.join(stats)}",
         flush=True,
     )
 
