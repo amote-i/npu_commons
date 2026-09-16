@@ -140,7 +140,8 @@ def _debug_log_launch(
             f"first={ci_flat[:8]} last={ci_flat[-8:]}"
         )
     print(
-        f"[wy_fast] recompute_w_u {tag}: grid=({NT},{B}) T={T} H={H} Hg={Hg} "
+        f"[wy_fast] pid={os.getpid()} recompute_w_u {tag}: "
+        f"grid=({NT},{B}) T={T} H={H} Hg={Hg} "
         f"K={K} V={V} BT={BT} BK={BK} BV={BV} "
         f"varlen={cu_seqlens is not None} cu_seqlens={cu} chunk_indices={ci} "
         f"k={tuple(k.shape)}x{tuple(k.stride())} "
@@ -224,8 +225,8 @@ def recompute_w_u_fwd_npu(
         # Elapsed is only meaningful with ASCEND_LAUNCH_BLOCKING=1 (sync launch);
         # without it the launch returns immediately before the kernel finishes.
         print(
-            f"[wy_fast] recompute_w_u launched OK in "
-            f"{(time.perf_counter() - t0) * 1e3:.1f} ms",
+            f"[wy_fast] pid={os.getpid()} dev={k.device} recompute_w_u "
+            f"launched OK in {(time.perf_counter() - t0) * 1e3:.1f} ms",
             flush=True,
         )
     return w, u
