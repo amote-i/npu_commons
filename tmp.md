@@ -140,12 +140,14 @@ def _debug_log_launch(
         ("g", g_cumsum),
         ("A", A),
     ):
-        # NOTE: forces a device sync per tensor; debug only. The kernel applies
-        # tl.exp(g) directly, so g's abs-max matters (fp32 exp overflows >~88).
+        # NOTE: forces a device sync per tensor; debug only. Signed min/max on
+        # purpose: the kernel applies tl.exp(g) directly, so only a *positive*
+        # g above ~88 overflows to inf (a large negative g just underflows).
         nan = int(torch.isnan(t).sum().item())
         inf = int(torch.isinf(t).sum().item())
-        amax = float(t.abs().amax().item())
-        stats.append(f"{name} nan={nan} inf={inf} amax={amax:.3g}")
+        tmin = float(t.min().item())
+        tmax = float(t.max().item())
+        stats.append(f"{name} nan={nan} inf={inf} min={tmin:.3g} max={tmax:.3g}")
     ci = None
     if chunk_indices is not None:
         ci_flat = chunk_indices.flatten().tolist()
