@@ -1,213 +1,231 @@
+# Adapted and Merge from
+#   https://github.com/sglang/python/sglang/srt/layers/attention/fla/wy_fast.py
+# -*- coding: utf-8 -*-
+# Copyright (c) 2023-2025, By Triton_Ascend & sglang_ascend
+
 import os
 import time
+from typing import List, Optional, Tuple, Union
 
-import pytest
-import sgl_kernel_npu  # noqa: F401  registers npu ops before pytestmark
 import torch
 import torch.nn.functional as F
-import torch_npu  # noqa: F401  makes torch.ops.npu namespace available
-from sgl_kernel_npu.fla.solve_tril import solve_tril_npu as solve_tril
-from utils import require_npu_op
-
-NPU_DEVICE = "npu"
-
-# ---------------------------------------------------------------------------
-# Incident reproduction: merge_16x16_to_64x64_inverse_kernel aicore timeout
-# (2026-09-14, rtStreamSynchronize 507014, blockDim=35424, fault blk=32787).
-#
-# Reproduces the exact launch: varlen batch of 24 packed sequences totalling
-# 47232 tokens -> NT=738, H=48, grid = NT * H = 35424. Tweak _INCIDENT_SEQS /
-# _INCIDENT_H if shape logging in serving reveals the real packing.
-#
-# Run on a dedicated card (a reproduced hang wedges the process until the
-# watchdog fires, and possibly longer):
-#   ASCEND_RT_VISIBLE_DEVICES=<n> python test_solve_tril.py
-#
-# Reading the result:
-#   - RuntimeError aicore timeout / 507014  -> reproduced. Compare the new
-#     PLOG against the incident one: ProcLogicCqReport errType=0x4,
-#     PrintCoreInfo's blk field (incident had blk=32787, just past 32768),
-#     GetArgsInfo blockDim=35424.
-#   - clean exit                          -> not reproducible standalone;
-#     the printed timing/correctness of both launches is then the takeaway.
-# ---------------------------------------------------------------------------
-
-_INCIDENT_SEQS = [2048] * 23 + [128]  # 47232 tokens, NT=738
-_INCIDENT_H = 48
-
-LEGACY_SKIP_REASON = "solve_tril API is not consistent with upstream fla."
-
-
-def get_abs_err(x, y):
-    return (x.detach() - y.detach()).flatten().abs().max().item()
-
-
-def get_err_ratio(x, y):
-    err = (x.detach() - y.detach()).flatten().square().mean().sqrt().item()
-    base = (x.detach()).flatten().square().mean().sqrt().item()
-    return err / (base + 1e-8)
-
-
-def assert_close(prefix, ref, tri, ratio, err_atol=1e-6):
-    abs_atol = get_abs_err(ref, tri)
-    msg = f"{prefix:>16} diff: {abs_atol:.6f} ratio: {get_err_ratio(ref, tri):.6f}"
-    error_rate = get_err_ratio(ref, tri)
-    if abs_atol <= err_atol:
-        return
-    else:
-        assert error_rate < ratio, msg
-
-
-def print_diff(name, ref, tri, atol=0.005):
-    abs_diff = torch.abs(ref - tri)
-    max_abs_diff = abs_diff.max().item()
-    print(f"[{name}] Max absolute difference: {max_abs_diff:.6f}")
-    if max_abs_diff > atol:
-        print(f"Exceeds tolerance ({atol})!")
-
-
-@pytest.mark.skip(reason=LEGACY_SKIP_REASON)
-@require_npu_op("triangular_inverse")
-@pytest.mark.parametrize(
-    ("B", "T", "H", "chunk_size"),
-    [
-        pytest.param(*test, id="B{}-T{}-H{}-chunk_size{}".format(*test))
-        for test in [
-            (1, 63, 1, 16),
-            (2, 500, 4, 32),
-            (2, 1000, 5, 64),
-            (3, 1024, 6, 64),
-            (4, 2048, 8, 64),
-        ]
-    ],
+import triton
+import triton.language as tl
+from sgl_kernel_npu.fla.utils import (
+    exp,
+    prepare_chunk_indices,
+    prepare_chunk_offsets,
+    safe_exp,
 )
-def test_solve_tril(B, T, H, chunk_size):
-    # do not randomly initialize A otherwise the inverse is not stable
-    k = F.normalize(
-        torch.randn((B, H, T, 64), dtype=torch.float32, device=NPU_DEVICE), dim=-1
-    )
-    torch.npu.synchronize()
-    # Pad the second-to-last dimension (T) to be a multiple of chunk_size
-    padding_size = (chunk_size - T % chunk_size) % chunk_size
-    k_padded = F.pad(k, (0, 0, 0, padding_size, 0, 0, 0, 0))
-    torch.npu.synchronize()
-    k_padded = k_padded.reshape(B, H, -1, chunk_size, 64)
-    torch.npu.synchronize()
-    A = (k_padded @ k_padded.transpose(-1, -2)).tril(-1).npu()
-    torch.npu.synchronize()
-
-    ref = torch.inverse(
-        A
-        + torch.eye(A.shape[-1], dtype=A.dtype, device=A.device)[None, None, None, ...]
-    )
-    torch.npu.synchronize()
-    ref = ref.reshape(B, H, -1, chunk_size)[:, :, :T, :]
-
-    torch.npu.synchronize()
-    tri = solve_tril(
-        A.reshape(B, H, -1, chunk_size)[:, :, :T, :].transpose(1, 2)
-    ).transpose(1, 2)
-    torch.npu.synchronize()
-
-    assert_close("solve_tril", ref, tri, 0.0001)
 
 
-def _build_case(seqs, H, seed=0):
-    """Varlen-packed banded input [1, T, H, 64] for solve_tril_npu, in the
-    same layout chunk_scaled_dot_kkt feeds in production: per 64-token chunk,
-    the chunk's rows hold (k @ k^T).tril(-1) of that sequence."""
-    total = int(sum(seqs))
-    gen = torch.Generator(device="cpu").manual_seed(seed)
-    k = F.normalize(
-        torch.randn((1, H, total, 64), dtype=torch.float32, generator=gen), dim=-1
-    ).to(NPU_DEVICE)
+@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
+@triton.jit(do_not_specialize=["T"])
+def recompute_w_u_fwd_kernel_npu_kernel(
+    k,
+    v,
+    beta,
+    w,
+    u,
+    A,
+    g,
+    cu_seqlens,
+    chunk_indices,
+    T,
+    H: tl.constexpr,
+    Hg: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    T_max = T
+    i_t_o, _ = tl.program_id(0), tl.program_id(1)
+    for i_bh in range(H):
+        i_b, i_h = i_bh // H, i_bh % H
+        if IS_VARLEN:
+            i_n, i_t = tl.load(chunk_indices + i_t_o * 2).to(tl.int32), tl.load(
+                chunk_indices + i_t_o * 2 + 1
+            ).to(tl.int32)
+            bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
+                cu_seqlens + i_n + 1
+            ).to(tl.int32)
+            T = eos - bos
+        else:
+            bos, eos = i_b * T, i_b * T + T
 
-    A = torch.zeros(1, total, H, 64, dtype=torch.float32, device=NPU_DEVICE)
-    nt, bos = 0, 0
-    for length in seqs:
-        nc = -(-length // 64)
-        nt += nc
-        ks = F.pad(k[0, :, bos : bos + length, :], (0, 0, 0, nc * 64 - length))
-        blk = (ks.reshape(H, nc, 64, 64) @ ks.reshape(H, nc, 64, 64).transpose(-1, -2))
-        A[0, bos : bos + nc * 64] = blk.tril(-1).permute(1, 2, 0, 3).reshape(
-            nc * 64, H, 64
+        offs_t = tl.arange(0, BT)
+        global_offs_t = i_t * BT + offs_t
+        mask_t = global_offs_t < T
+
+        offs_t_2d = global_offs_t[:, None]
+        offs_bt = tl.arange(0, BT)[None, :]
+        ptr_A = A + (bos * H + i_h) * BT + offs_t_2d * (H * BT) + offs_bt * 1
+        mask_A = mask_t[:, None]
+        b_A = tl.load(ptr_A, mask=mask_A, other=0.0).to(tl.float32)
+
+        ptr_g = g + bos + i_h * T_max + global_offs_t
+        b_g = tl.exp(tl.load(ptr_g, mask=mask_t, other=0.0)).to(tl.float32)
+
+        ptr_beta = beta + bos + i_h * T_max + global_offs_t
+        b_beta = tl.load(ptr_beta, mask=mask_t, other=0.0).to(tl.float32)
+
+        for i_v in range(tl.cdiv(V, BV)):
+            # --- load v (BTxBV) ---
+            offs_v = i_v * BV + tl.arange(0, BV)[None, :]
+            mask_v = (mask_t[:, None]) & (offs_v < V)
+            # orig strides (H * V, 1)
+            ptr_v = v + (bos * H + i_h) * V + offs_t_2d * (H * V) + offs_v * 1
+            b_v = tl.load(ptr_v, mask=mask_v, other=0.0).to(tl.float32)
+
+            b_vb = b_v * b_beta[:, None]
+            b_u = tl.dot(b_A, b_vb, allow_tf32=False)
+            ptr_u = u + (bos * H + i_h) * V + offs_t_2d * (H * V) + offs_v * 1
+            tl.store(ptr_u, b_u.to(ptr_u.dtype.element_ty), mask=mask_v)
+
+        for i_k in range(tl.cdiv(K, BK)):
+            offs_k = i_k * BK + tl.arange(0, BK)[None, :]
+            mask_k = (mask_t[:, None]) & (offs_k < K)
+            # orig strides (Hg * K, 1)
+            ptr_k = (
+                k
+                + (bos * Hg + i_h // (H // Hg)) * K
+                + offs_t_2d * (Hg * K)
+                + offs_k * 1
+            )
+            b_k = tl.load(ptr_k, mask=mask_k, other=0.0).to(tl.float32)
+
+            b_kb = b_k * b_beta[:, None] * b_g[:, None]
+            b_w = tl.dot(b_A, b_kb)
+            ptr_w = w + (bos * H + i_h) * K + offs_t_2d * (H * K) + offs_k * 1
+            tl.store(ptr_w, b_w.to(ptr_w.dtype.element_ty), mask=mask_k)
+
+
+# Debug helper: set SGLK_WY_FAST_DEBUG=1 to log every recompute_w_u launch
+# (shapes, grid, varlen boundaries, elapsed time). Run together with
+# ASCEND_LAUNCH_BLOCKING=1 so a hung kernel surfaces synchronously: the last
+# "launching" line without a following "launched OK" is the culprit.
+_DEBUG_WY_FAST = os.environ.get("SGLK_WY_FAST_DEBUG", "0") == "1"
+
+
+def _debug_log_launch(
+    tag,
+    *,
+    NT,
+    B,
+    T,
+    H,
+    Hg,
+    K,
+    V,
+    BT,
+    BK,
+    BV,
+    k,
+    v,
+    A,
+    beta,
+    g_cumsum,
+    cu_seqlens,
+    chunk_indices,
+):
+    cu = cu_seqlens.tolist() if cu_seqlens is not None else None
+    ci = None
+    if chunk_indices is not None:
+        ci_flat = chunk_indices.flatten().tolist()
+        ci = (
+            f"n_chunks={len(ci_flat) // 2} "
+            f"first={ci_flat[:8]} last={ci_flat[-8:]}"
         )
-        bos += length
-
-    cu_list = [0]
-    for length in seqs:
-        cu_list.append(cu_list[-1] + length)
-    cu = torch.tensor(cu_list, dtype=torch.long).to(NPU_DEVICE)
-    return A, cu, nt
-
-
-def _diff_vs_reference(Ai, A, seqs):
-    """Max abs diff vs (I - A)^-1 (the kernel's convention per its source);
-    also reports (I + A)^-1 so a sign surprise is self-diagnosing."""
-    eye = torch.eye(64, dtype=torch.float32, device=A.device)
-    out_d = {"minus": 0.0, "plus": 0.0}
-    bos = 0
-    for length in seqs:
-        nc = -(-length // 64)
-        blk = A[0, bos : bos + nc * 64].reshape(nc, 64, *A.shape[2:]).permute(
-            2, 0, 1, 3
-        )
-        out = Ai[0, bos : bos + nc * 64].reshape(nc, 64, *Ai.shape[2:]).permute(
-            2, 0, 1, 3
-        )
-        m = (torch.arange(nc * 64, device=A.device) < length).reshape(1, nc, 64, 1)
-        for tag, ref in (
-            ("minus", torch.inverse(eye - blk)),
-            ("plus", torch.inverse(eye + blk)),
-        ):
-            out_d[tag] = max(out_d[tag], ((out - ref).abs() * m).max().item())
-        bos += length
-    return out_d
-
-
-def run_incident_repro():
-    # Small same-H control first: proves the card/kernel are healthy (and
-    # warms the H=48 varlen JIT specialization) before the incident launch.
-    control_seqs = [2048]
-    A, cu, nt = _build_case(control_seqs, _INCIDENT_H)
-    t0 = time.perf_counter()
-    Ai = solve_tril(A=A, cu_seqlens=cu, output_dtype=torch.float32)
-    torch.npu.synchronize()
-    d = _diff_vs_reference(Ai, A, control_seqs)
     print(
-        f"[control ] grid={nt * _INCIDENT_H} time={(time.perf_counter() - t0) * 1e3:.1f}ms "
-        f"diff_(I-A)^-1={d['minus']:.3e} diff_(I+A)^-1={d['plus']:.3e}",
+        f"[wy_fast] recompute_w_u {tag}: grid=({NT},{B}) T={T} H={H} Hg={Hg} "
+        f"K={K} V={V} BT={BT} BK={BK} BV={BV} "
+        f"varlen={cu_seqlens is not None} cu_seqlens={cu} chunk_indices={ci} "
+        f"k={tuple(k.shape)}x{tuple(k.stride())} "
+        f"v={tuple(v.shape)}x{tuple(v.stride())} "
+        f"A={tuple(A.shape)}x{tuple(A.stride())} "
+        f"beta={tuple(beta.shape)}x{tuple(beta.stride())} "
+        f"g={tuple(g_cumsum.shape)}x{tuple(g_cumsum.stride())} "
+        f"dev={k.device} warps=4 stages=3",
         flush=True,
     )
-    del A, Ai
 
-    A, cu, nt = _build_case(_INCIDENT_SEQS, _INCIDENT_H)
-    grid = nt * _INCIDENT_H
-    print(
-        f"[incident] tokens={sum(_INCIDENT_SEQS)} seqs={len(_INCIDENT_SEQS)} "
-        f"NT={nt} H={_INCIDENT_H} grid={grid}",
-        flush=True,
+
+def recompute_w_u_fwd_npu(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    g_cumsum: torch.Tensor,
+    A: torch.Tensor,
+    cu_seqlens: Optional[torch.LongTensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    B, T, Hg, K, V = *k.shape, v.shape[-1]
+    H = v.shape[-2]
+    BT = A.shape[-1]
+
+    chunk_indices = (
+        prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     )
-    t0 = time.perf_counter()
-    Ai = solve_tril(A=A, cu_seqlens=cu, output_dtype=torch.float32)
-    torch.npu.synchronize()
-    dt = (time.perf_counter() - t0) * 1e3
-    d = _diff_vs_reference(Ai, A, _INCIDENT_SEQS)
-    print(
-        f"[incident] completed time={dt:.1f}ms "
-        f"diff_(I-A)^-1={d['minus']:.3e} diff_(I+A)^-1={d['plus']:.3e}",
-        flush=True,
+    NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
+    BK = 128
+    BV = 128
+    u = torch.empty_like(v)
+    w = k.new_empty(B, T, H, K)
+    # Pre-transpose tensors outside the kernel to ensure contiguous memory access within the kernel
+    # avoiding scattered (non-contiguous) access that may lead to axis expansion
+    beta = beta.transpose(1, 2).contiguous()
+    g_cumsum = g_cumsum.transpose(1, 2).contiguous()
+    if _DEBUG_WY_FAST:
+        _debug_log_launch(
+            "launching",
+            NT=NT,
+            B=B,
+            T=T,
+            H=H,
+            Hg=Hg,
+            K=K,
+            V=V,
+            BT=BT,
+            BK=BK,
+            BV=BV,
+            k=k,
+            v=v,
+            A=A,
+            beta=beta,
+            g_cumsum=g_cumsum,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+        t0 = time.perf_counter()
+    recompute_w_u_fwd_kernel_npu_kernel[(NT, B)](
+        k=k,
+        v=v,
+        beta=beta,
+        w=w,
+        u=u,
+        A=A,
+        g=g_cumsum,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        T=T,
+        H=H,
+        Hg=Hg,
+        K=K,
+        V=V,
+        BT=BT,
+        BK=BK,
+        BV=BV,
+        num_warps=4,
+        num_stages=3,
     )
-    assert d["minus"] < 5e-3, f"completed but wrong result (diff={d['minus']:.3e})"
-
-
-@pytest.mark.skipif(
-    os.getenv("SGL_REPRO") != "1",
-    reason="destructive incident reproduction; set SGL_REPRO=1 on a dedicated card",
-)
-def test_solve_tril_incident_repro():
-    run_incident_repro()
-
-
-if __name__ == "__main__":
-    run_incident_repro()
+    if _DEBUG_WY_FAST:
+        # Elapsed is only meaningful with ASCEND_LAUNCH_BLOCKING=1 (sync launch);
+        # without it the launch returns immediately before the kernel finishes.
+        print(
+            f"[wy_fast] recompute_w_u launched OK in "
+            f"{(time.perf_counter() - t0) * 1e3:.1f} ms",
+            flush=True,
+        )
+    return w, u
