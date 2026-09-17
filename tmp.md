@@ -262,7 +262,8 @@ def main_parent(args):
                 counts[rec["status"]] = counts.get(rec["status"], 0) + 1
 
                 flag = "  <-- HIT" if is_hit(rec["status"]) else ""
-                print(f"[trial {trial_id:>3}] {rec['status']:<14} {cfg['name']}{flag}", flush=True)
+                diff = f" diff={rec.get('max_abs_diff')}" if rec.get("max_abs_diff") is not None else ""
+                print(f"[trial {trial_id:>3}] {rec['status']:<14} {cfg['name']}{flag}{diff}", flush=True)
 
                 if is_hit(rec["status"]):
                     hits.append(rec)
@@ -405,9 +406,20 @@ def child_run_trial(cfg, args):
         cu_seqlens = None
     H = cfg["H"]
 
-    # A[b, t, h, :] is row (t % 64) of the strictly-lower 64x64 block, so
-    # entry j must vanish for j > t % 64.
-    r = (torch.arange(T, device=dev) % BT)
+    # A[b, t, h, :] is row ((t - bos) % 64) of the strictly-lower 64x64 block of
+    # its own sequence/batch, so entry j must vanish for j > (t - bos) % 64.
+    # NOTE: the block-row index is the position INSIDE the sequence, which
+    # differs from global t % 64 whenever a sequence starts at a non-multiple
+    # of 64 (ragged varlen) -- feeding a non-strictly-lower A violates the
+    # kernel's documented precondition and the merge formula no longer applies.
+    if cu_seqlens is not None:
+        r = torch.empty(T, dtype=torch.long)
+        cl = cu_seqlens.tolist()
+        for s, e in zip(cl[:-1], cl[1:]):
+            r[s:e] = torch.arange(e - s) % BT
+        r = r.to(dev)
+    else:
+        r = torch.arange(T, device=dev) % BT
     keep = torch.arange(BT, device=dev)[None, :] <= r[:, None]  # [T, BT]
     A = torch.randn(B * T * H * BT, device=dev, dtype=torch.float32).reshape(B, T, H, BT)
     A = A * keep[None, :, None, :] * cfg["scale"]
