@@ -420,7 +420,11 @@ def child_run_trial(cfg, args):
         r = r.to(dev)
     else:
         r = torch.arange(T, device=dev) % BT
-    keep = torch.arange(BT, device=dev)[None, :] <= r[:, None]  # [T, BT]
+    # strictly lower: row r keeps only j < r (the diagonal j == r must be ZERO --
+    # upstream builds A with .tril(-1); the kernel also enforces this internally
+    # via -b_A * (rows > cols), so a nonzero diagonal silently changes the
+    # reference but not the kernel).
+    keep = torch.arange(BT, device=dev)[None, :] < r[:, None]  # [T, BT]
     A = torch.randn(B * T * H * BT, device=dev, dtype=torch.float32).reshape(B, T, H, BT)
     A = A * keep[None, :, None, :] * cfg["scale"]
     if a_dtype is not torch.float32:
