@@ -1,0 +1,53 @@
+# repro_watermark_npu.py —— 逐段定位卡点 + hash parity（修正版2）
+import time
+import torch
+import torch_npu  # noqa: F401
+
+from sglang.srt.sampling.watermarking.core import (
+    _hash_contexts, _watermark_hash32_torch,
+    _truncate_probabilities, select_watermark_tokens_torch,
+)
+
+dev = "npu"
+B, V = 4, 2000
+
+# --- 1. hash parity：CPU vs NPU 逐位一致 ---
+ctx = torch.randint(1, 150000, (B, 8), dtype=torch.int32)
+lens = torch.full((B,), 8, dtype=torch.int32)
+h_cpu = _hash_contexts(ctx, lens)
+h_npu = _hash_contexts(ctx.to(dev), lens.to(dev))
+print("context hash bit-exact:", torch.equal(h_cpu, h_npu.cpu()))
+
+keys_host = torch.full((B,), 0x0123456789abcdef, dtype=torch.int64)
+toks = torch.arange(V, dtype=torch.int64)
+w_cpu = _watermark_hash32_torch(keys_host, h_cpu, toks)
+w_npu = _watermark_hash32_torch(keys_host.to(dev), h_npu, toks.to(dev))
+print("watermark hash bit-exact:", torch.equal(w_cpu, w_npu.cpu()))
+
+# --- 2. force 路径逐段计时（keys 必须在设备上，与真实链路一致） ---
+keys = keys_host.to(dev)
+logits = torch.randn(B, V, device=dev)
+temp = torch.ones(B, 1, device=dev)
+topk = torch.full((B,), 20, dtype=torch.int32, device=dev)
+topp = torch.full((B,), 0.95, device=dev)
+minp = torch.zeros(B, device=dev)
+
+for name, fn in [
+    ("truncate(topk/topp/minp)", lambda: _truncate_probabilities(logits, temp, topk, topp, minp)),
+    ("select(argmax)", lambda: select_watermark_tokens_torch(
+        _truncate_probabilities(logits, temp, topk, topp, minp), h_npu, keys)),
+    ("nonzero(动态shape+D2H同步)", lambda: (logits.amax(-1) > 0).nonzero(as_tuple=True)[0]),
+]:
+    torch.npu.synchronize(); t0 = time.time()
+    out = fn()
+    torch.npu.synchronize()
+    print(f"{name}: ok, {time.time()-t0:.3f}s")
+    del out
+
+# --- 3. force 尾部的 index_put 模式 ---
+torch.npu.synchronize(); t0 = time.time()
+rows = (logits.amax(-1) > 0).nonzero(as_tuple=True)[0]
+logits[rows] = -torch.inf
+logits[rows, rows % V] = 0.0
+torch.npu.synchronize()
+print(f"index_put(-inf + 双索引写): ok, {time.time()-t0:.3f}s")
