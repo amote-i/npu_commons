@@ -1,0 +1,137 @@
+"""
+E2E test for NPU per-token prefill weight version attribution
+(--enable-prefill-weight-versions).
+
+Flow:
+  1. A fresh prompt reports one span covering the whole prompt under the
+     initial weight version.
+  2. POST /update_weight_version relabels; a longer prompt reusing the cached
+     prefix reports two spans: old version over the reused prefix, new
+     version over the freshly computed suffix.
+
+"""
+
+import unittest
+
+import requests
+
+from sglang.srt.utils import kill_process_tree
+from sglang.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
+from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    popen_launch_server,
+)
+
+register_npu_ci(est_time=120, suite="full-1-npu-a3", nightly=True)
+
+
+class TestNpuPrefillWeightVersions(CustomTestCase):
+    """E2E: --enable-prefill-weight-versions span attribution on NPU.
+
+    [Test Category] RL Weight Versions
+    [Test Target] --enable-prefill-weight-versions, POST /update_weight_version
+    """
+
+    REQUEST_TIMEOUT = 120
+
+    # Prompt boundary ends with "." so P1's tokens are a strict token-prefix
+    # of P2's tokens (no tokenizer merge across the boundary).
+    PROMPT_P1 = "The capital of France is Paris. The capital of Germany is Berlin."
+    PROMPT_P2 = (
+        "The capital of France is Paris. The capital of Germany is Berlin."
+        " The capital of Italy is Rome."
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--attention-backend",
+                "ascend",
+                "--enable-prefill-weight-versions",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def _generate(self, text: str, max_new_tokens: int = 8):
+        """Send a deterministic /generate request, return meta_info."""
+        resp = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": text,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": max_new_tokens,
+                },
+            },
+            timeout=self.REQUEST_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()["meta_info"]
+
+    def test_prefill_weight_versions(self):
+        """
+        S1: Fresh prompt → single span under the initial version.
+        S2: Version relabel + prefix reuse → split spans with correct
+            attribution on each side of the cache-hit boundary.
+        """
+        # ── S1: fresh prompt, whole prompt computed under "default" ──
+        meta1 = self._generate(self.PROMPT_P1)
+        spans1 = meta1["prefill_weight_versions"]
+        print(f"[DEBUG] S1 prompt_tokens={meta1['prompt_tokens']}, spans={spans1}")
+        self.assertEqual(
+            spans1,
+            [{"version": "default", "start": 0, "end": meta1["prompt_tokens"]}],
+            f"S1: fresh prompt should be a single span, got {spans1}",
+        )
+
+        # ── S2: relabel, then reuse P1's cached prefix inside P2 ──
+        requests.post(
+            self.base_url + "/update_weight_version",
+            json={"new_version": "v2"},
+            timeout=30,
+        ).raise_for_status()
+
+        meta2 = self._generate(self.PROMPT_P2)
+        spans2 = meta2["prefill_weight_versions"]
+        print(
+            f"[DEBUG] S2 prompt_tokens={meta2['prompt_tokens']}, spans={spans2}"
+        )
+        self.assertGreaterEqual(
+            len(spans2), 2, f"S2: expected a version split, got {spans2}"
+        )
+        self.assertEqual(
+            spans2[0],
+            {"version": "default", "start": 0, "end": meta1["prompt_tokens"]},
+            "S2: reused prefix should be attributed to the old version "
+            f"'default' (page_size > 1 rounds the match down; got {spans2})",
+        )
+        self.assertEqual(
+            spans2[-1]["version"],
+            "v2",
+            f"S2: freshly computed suffix should be attributed to v2, got {spans2}",
+        )
+        self.assertEqual(
+            spans2[-1]["end"],
+            meta2["prompt_tokens"],
+            f"S2: spans must cover the full prompt, got {spans2}",
+        )
+        # Output-side attribution rides along in the same response
+        self.assertEqual(
+            meta2["weight_version"], "v2", f"S2: active version should be v2"
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
