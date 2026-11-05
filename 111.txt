@@ -9,6 +9,10 @@ Flow:
      prefix reports two spans: old version over the reused prefix, new
      version over the freshly computed suffix.
 
+Aligned with the upstream CUDA test
+test/registered/rl/test_weight_version_spans.py::test_17_reused_prefix_keeps_
+the_version_that_computed_it.
+
 """
 
 import unittest
@@ -37,13 +41,17 @@ class TestNpuPrefillWeightVersions(CustomTestCase):
 
     REQUEST_TIMEOUT = 120
 
-    # Prompt boundary ends with "." so P1's tokens are a strict token-prefix
-    # of P2's tokens (no tokenizer merge across the boundary).
-    PROMPT_P1 = "The capital of France is Paris. The capital of Germany is Berlin."
-    PROMPT_P2 = (
-        "The capital of France is Paris. The capital of Germany is Berlin."
-        " The capital of Italy is Rome."
+    # Shared prefix (ends with "." so P1's tokens are a strict token-prefix of
+    # P2's tokens), followed by a distinctive tail per request.
+    SHARED_PREFIX = (
+        "You are a meticulous assistant. Follow every instruction to the letter, "
+        "explain your reasoning step by step, and never skip an intermediate result. "
+        "Here is the background material you must rely on for the whole "
+        "conversation. The capital of France is Paris. "
+        "The capital of Germany is Berlin."
     )
+    PROMPT_P1 = SHARED_PREFIX
+    PROMPT_P2 = SHARED_PREFIX + " The capital of Italy is Rome."
 
     @classmethod
     def setUpClass(cls):
@@ -73,12 +81,27 @@ class TestNpuPrefillWeightVersions(CustomTestCase):
                 "sampling_params": {
                     "temperature": 0,
                     "max_new_tokens": max_new_tokens,
+                    "ignore_eos": True,
                 },
             },
             timeout=self.REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
         return resp.json()["meta_info"]
+
+    def _set_weight_version(self, new_version: str):
+        """Relabel the weight version. abort_all_requests=False keeps the
+        radix cache and any in-flight state intact (upstream test_17 does the
+        same); the endpoint only returns after every scheduler applied it."""
+        resp = requests.post(
+            self.base_url + "/update_weight_version",
+            json={
+                "new_version": new_version,
+                "abort_all_requests": False,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
 
     def test_prefill_weight_versions(self):
         """
@@ -97,30 +120,35 @@ class TestNpuPrefillWeightVersions(CustomTestCase):
         )
 
         # ── S2: relabel, then reuse P1's cached prefix inside P2 ──
-        requests.post(
-            self.base_url + "/update_weight_version",
-            json={"new_version": "v2"},
-            timeout=30,
-        ).raise_for_status()
+        self._set_weight_version("v2")
 
         meta2 = self._generate(self.PROMPT_P2)
         spans2 = meta2["prefill_weight_versions"]
         print(
-            f"[DEBUG] S2 prompt_tokens={meta2['prompt_tokens']}, spans={spans2}"
+            f"[DEBUG] S2 cached_tokens={meta2['cached_tokens']}, "
+            f"prompt_tokens={meta2['prompt_tokens']}, spans={spans2}"
         )
-        self.assertGreaterEqual(
-            len(spans2), 2, f"S2: expected a version split, got {spans2}"
+        self.assertGreater(
+            meta2["cached_tokens"],
+            0,
+            "S2: P2 did not reuse P1's cached prefix (cached_tokens=0, "
+            f"spans={spans2}) — radix cache miss, prefix reuse is the "
+            "precondition of this test",
         )
         self.assertEqual(
-            spans2[0],
-            {"version": "default", "start": 0, "end": meta1["prompt_tokens"]},
-            "S2: reused prefix should be attributed to the old version "
-            f"'default' (page_size > 1 rounds the match down; got {spans2})",
+            [span["version"] for span in spans2],
+            ["default", "v2"],
+            f"S2: expected one stale span then one fresh span, got {spans2}",
         )
         self.assertEqual(
-            spans2[-1]["version"],
-            "v2",
-            f"S2: freshly computed suffix should be attributed to v2, got {spans2}",
+            spans2[0]["start"],
+            0,
+            f"S2: first span must start at token 0, got {spans2}",
+        )
+        self.assertEqual(
+            spans2[0]["end"],
+            meta2["cached_tokens"],
+            f"S2: stale span must cover exactly the reused prefix, got {spans2}",
         )
         self.assertEqual(
             spans2[-1]["end"],
@@ -128,9 +156,7 @@ class TestNpuPrefillWeightVersions(CustomTestCase):
             f"S2: spans must cover the full prompt, got {spans2}",
         )
         # Output-side attribution rides along in the same response
-        self.assertEqual(
-            meta2["weight_version"], "v2", f"S2: active version should be v2"
-        )
+        self.assertEqual(meta2["weight_version"], "v2", "S2: active version")
 
 
 if __name__ == "__main__":
