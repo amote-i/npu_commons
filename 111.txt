@@ -19,7 +19,6 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
@@ -27,6 +26,7 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_npu_ci(est_time=120, suite="full-1-npu-a3", nightly=True)
@@ -73,7 +73,8 @@ class TestNpuPrefillWeightVersions(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if hasattr(cls, "process") and cls.process is not None:
+            terminate_and_kill_process_tree(cls.process)
 
     def _generate(self, text: str, max_new_tokens: int = 8):
         """Send a deterministic /generate request, return meta_info."""
@@ -106,12 +107,21 @@ class TestNpuPrefillWeightVersions(CustomTestCase):
         )
         resp.raise_for_status()
 
+    def _flush_cache(self):
+        requests.post(self.base_url + "/flush_cache", timeout=30).raise_for_status()
+
     def test_prefill_weight_versions(self):
         """
         S1: Fresh prompt → single span under the initial version.
         S2: Version relabel + prefix reuse → split spans with correct
             attribution on each side of the cache-hit boundary.
         """
+        # CI retries re-run only this method on the same server: restore the
+        # fresh-server state (empty radix cache + initial version label)
+        # before each attempt, or S1 would hit the previous attempt's cache.
+        self._flush_cache()
+        self._set_weight_version("default")
+
         # ── S1: fresh prompt, whole prompt computed under "default" ──
         meta1 = self._generate(self.PROMPT_P1)
         spans1 = meta1["prefill_weight_versions"]
@@ -154,12 +164,22 @@ class TestNpuPrefillWeightVersions(CustomTestCase):
             f"S2: stale span must cover exactly the reused prefix, got {spans2}",
         )
         self.assertEqual(
+            spans2[1]["start"],
+            meta2["cached_tokens"],
+            f"S2: spans must be contiguous at the cache-hit boundary, got {spans2}",
+        )
+        self.assertEqual(
             spans2[-1]["end"],
             meta2["prompt_tokens"],
             f"S2: spans must cover the full prompt, got {spans2}",
         )
         # Output-side attribution rides along in the same response
         self.assertEqual(meta2["weight_version"], "v2", "S2: active version")
+        self.assertEqual(
+            [span["version"] for span in meta2["weight_versions"]],
+            ["v2"],
+            f"S2: output tokens all generated under v2, got {meta2['weight_versions']}",
+        )
 
 
 if __name__ == "__main__":
