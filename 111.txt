@@ -9,9 +9,7 @@ Flow:
      prefix reports two spans: old version over the reused prefix, new
      version over the freshly computed suffix.
 
-Aligned with the upstream CUDA test
-test/registered/rl/test_weight_version_spans.py::test_17_reused_prefix_keeps_
-the_version_that_computed_it.
+Aligned with upstream test_weight_version_spans.py::test_17 (CUDA).
 
 """
 
@@ -41,12 +39,8 @@ class TestNpuPrefillWeightVersions(CustomTestCase):
 
     REQUEST_TIMEOUT = 120
 
-    # Shared prefix (ends with "." so P1's tokens are a strict token-prefix of
-    # P2's tokens), followed by a distinctive tail per request.
-    # NPU defaults to page_size=128 (hardware_backend/npu/utils.py), and radix
-    # prefix matching rounds down to page boundaries — the shared prefix must
-    # exceed one page or P2 never reuses P1's KV (cached_tokens stays 0).
-    # ~40 tokens x 10 repetitions + tail ≈ 430 tokens > 3 pages.
+    # Radix matching rounds down to NPU page boundaries (page_size=128), so
+    # the shared prefix must exceed one page or P2 never reuses P1's KV.
     SHARED_PREFIX = (
         "You are a meticulous assistant. Follow every instruction to the letter, "
         "explain your reasoning step by step, and never skip an intermediate result. "
@@ -73,8 +67,8 @@ class TestNpuPrefillWeightVersions(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process is not None:
-            terminate_and_kill_process_tree(cls.process)
+        # SIGTERM first so the server releases NPU memory itself.
+        terminate_and_kill_process_tree(cls.process)
 
     def _generate(self, text: str, max_new_tokens: int = 8):
         """Send a deterministic /generate request, return meta_info."""
@@ -94,9 +88,7 @@ class TestNpuPrefillWeightVersions(CustomTestCase):
         return resp.json()["meta_info"]
 
     def _set_weight_version(self, new_version: str):
-        """Relabel the weight version. abort_all_requests=False keeps the
-        radix cache and any in-flight state intact (upstream test_17 does the
-        same); the endpoint only returns after every scheduler applied it."""
+        """Relabel; abort_all_requests=False keeps the radix cache intact."""
         resp = requests.post(
             self.base_url + "/update_weight_version",
             json={
@@ -116,9 +108,8 @@ class TestNpuPrefillWeightVersions(CustomTestCase):
         S2: Version relabel + prefix reuse → split spans with correct
             attribution on each side of the cache-hit boundary.
         """
-        # CI retries re-run only this method on the same server: restore the
-        # fresh-server state (empty radix cache + initial version label)
-        # before each attempt, or S1 would hit the previous attempt's cache.
+        # CI retries re-run only this method on the same server — restore
+        # fresh-server state first, or S1 hits the previous attempt's cache.
         self._flush_cache()
         self._set_weight_version("default")
 
@@ -141,12 +132,8 @@ class TestNpuPrefillWeightVersions(CustomTestCase):
             f"[DEBUG] S2 cached_tokens={meta2['cached_tokens']}, "
             f"prompt_tokens={meta2['prompt_tokens']}, spans={spans2}"
         )
-        # cached_tokens — the page-aligned prefix-match length — is the split
-        # point: below it P2 reuses KV written under "default", above it the
-        # suffix was computed fresh under "v2". (The server-reported value is
-        # the only exact oracle: the match may extend into P1's generated
-        # tokens when they happen to continue like P2's suffix. A 0 here means
-        # the radix prefix never matched — page size > shared prefix length.)
+        # cached_tokens (page-aligned prefix-match length) is the split point:
+        # reused "default" KV below it, freshly computed "v2" suffix above.
         cached = meta2["cached_tokens"]
         self.assertEqual(
             spans2,
