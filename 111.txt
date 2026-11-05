@@ -141,37 +141,25 @@ class TestNpuPrefillWeightVersions(CustomTestCase):
             f"[DEBUG] S2 cached_tokens={meta2['cached_tokens']}, "
             f"prompt_tokens={meta2['prompt_tokens']}, spans={spans2}"
         )
-        self.assertGreater(
-            meta2["cached_tokens"],
-            0,
-            "S2: P2 did not reuse P1's cached prefix (cached_tokens=0, "
-            f"spans={spans2}) — radix cache miss; note the shared prefix "
-            "must exceed the NPU page size (128 tokens) to be matchable",
-        )
+        # cached_tokens — the page-aligned prefix-match length — is the split
+        # point: below it P2 reuses KV written under "default", above it the
+        # suffix was computed fresh under "v2". (The server-reported value is
+        # the only exact oracle: the match may extend into P1's generated
+        # tokens when they happen to continue like P2's suffix. A 0 here means
+        # the radix prefix never matched — page size > shared prefix length.)
+        cached = meta2["cached_tokens"]
         self.assertEqual(
-            [span["version"] for span in spans2],
-            ["default", "v2"],
-            f"S2: expected one stale span then one fresh span, got {spans2}",
-        )
-        self.assertEqual(
-            spans2[0]["start"],
-            0,
-            f"S2: first span must start at token 0, got {spans2}",
-        )
-        self.assertEqual(
-            spans2[0]["end"],
-            meta2["cached_tokens"],
-            f"S2: stale span must cover exactly the reused prefix, got {spans2}",
-        )
-        self.assertEqual(
-            spans2[1]["start"],
-            meta2["cached_tokens"],
-            f"S2: spans must be contiguous at the cache-hit boundary, got {spans2}",
-        )
-        self.assertEqual(
-            spans2[-1]["end"],
-            meta2["prompt_tokens"],
-            f"S2: spans must cover the full prompt, got {spans2}",
+            spans2,
+            [
+                {"version": "default", "start": 0, "end": cached},
+                {
+                    "version": "v2",
+                    "start": cached,
+                    "end": meta2["prompt_tokens"],
+                },
+            ],
+            "S2: expected a stale 'default' span over the reused prefix "
+            f"(cached_tokens={cached}) followed by a 'v2' span over the rest",
         )
         # Output-side attribution rides along in the same response
         self.assertEqual(meta2["weight_version"], "v2", "S2: active version")
