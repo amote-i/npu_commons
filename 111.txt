@@ -43,13 +43,16 @@ class TestNpuPrefillWeightVersions(CustomTestCase):
 
     # Shared prefix (ends with "." so P1's tokens are a strict token-prefix of
     # P2's tokens), followed by a distinctive tail per request.
+    # NPU defaults to page_size=128 (hardware_backend/npu/utils.py), and radix
+    # prefix matching rounds down to page boundaries — the shared prefix must
+    # exceed one page or P2 never reuses P1's KV (cached_tokens stays 0).
+    # ~40 tokens x 10 repetitions + tail ≈ 430 tokens > 3 pages.
     SHARED_PREFIX = (
         "You are a meticulous assistant. Follow every instruction to the letter, "
         "explain your reasoning step by step, and never skip an intermediate result. "
         "Here is the background material you must rely on for the whole "
-        "conversation. The capital of France is Paris. "
-        "The capital of Germany is Berlin."
-    )
+        "conversation. "
+    ) * 10 + "The capital of France is Paris. The capital of Germany is Berlin."
     PROMPT_P1 = SHARED_PREFIX
     PROMPT_P2 = SHARED_PREFIX + " The capital of Italy is Rome."
 
@@ -132,8 +135,8 @@ class TestNpuPrefillWeightVersions(CustomTestCase):
             meta2["cached_tokens"],
             0,
             "S2: P2 did not reuse P1's cached prefix (cached_tokens=0, "
-            f"spans={spans2}) — radix cache miss, prefix reuse is the "
-            "precondition of this test",
+            f"spans={spans2}) — radix cache miss; note the shared prefix "
+            "must exceed the NPU page size (128 tokens) to be matchable",
         )
         self.assertEqual(
             [span["version"] for span in spans2],
