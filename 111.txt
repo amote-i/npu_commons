@@ -1,161 +1,301 @@
-"""
-E2E test for NPU per-token prefill weight version attribution
-(--enable-prefill-weight-versions).
-
-Flow:
-  1. A fresh prompt reports one span covering the whole prompt under the
-     initial weight version.
-  2. POST /update_weight_version relabels; a longer prompt reusing the cached
-     prefix reports two spans: old version over the reused prefix, new
-     version over the freshly computed suffix.
-
-Aligned with upstream test_weight_version_spans.py::test_17 (CUDA).
-
-"""
-
-import unittest
-
-import requests
-
-from sglang.test.ascend.test_ascend_utils import LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
-from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-    DEFAULT_URL_FOR_TEST,
-    CustomTestCase,
-    popen_launch_server,
-    terminate_and_kill_process_tree,
-)
-
-register_npu_ci(est_time=120, suite="full-1-npu-a3", nightly=True)
-
-
-class TestNpuPrefillWeightVersions(CustomTestCase):
-    """E2E: --enable-prefill-weight-versions span attribution on NPU.
-
-    [Test Category] RL Weight Versions
-    [Test Target] --enable-prefill-weight-versions, POST /update_weight_version
-    """
-
-    REQUEST_TIMEOUT = 120
-
-    # Radix matching rounds down to NPU page boundaries (page_size=128), so
-    # the shared prefix must exceed one page or P2 never reuses P1's KV.
-    SHARED_PREFIX = (
-        "You are a meticulous assistant. Follow every instruction to the letter, "
-        "explain your reasoning step by step, and never skip an intermediate result. "
-        "Here is the background material you must rely on for the whole "
-        "conversation. "
-    ) * 10 + "The capital of France is Paris. The capital of Germany is Berlin."
-    PROMPT_P1 = SHARED_PREFIX
-    PROMPT_P2 = SHARED_PREFIX + " The capital of Italy is Rome."
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--attention-backend",
-                "ascend",
-                "--enable-prefill-weight-versions",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        # SIGTERM first so the server releases NPU memory itself.
-        terminate_and_kill_process_tree(cls.process)
-
-    def _generate(self, text: str, max_new_tokens: int = 8):
-        """Send a deterministic /generate request, return meta_info."""
-        resp = requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": text,
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": max_new_tokens,
-                    "ignore_eos": True,
-                },
-            },
-            timeout=self.REQUEST_TIMEOUT,
-        )
-        resp.raise_for_status()
-        return resp.json()["meta_info"]
-
-    def _set_weight_version(self, new_version: str):
-        """Relabel; abort_all_requests=False keeps the radix cache intact."""
-        resp = requests.post(
-            self.base_url + "/update_weight_version",
-            json={
-                "new_version": new_version,
-                "abort_all_requests": False,
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-
-    def _flush_cache(self):
-        requests.post(self.base_url + "/flush_cache", timeout=30).raise_for_status()
-
-    def test_prefill_weight_versions(self):
-        """
-        S1: Fresh prompt → single span under the initial version.
-        S2: Version relabel + prefix reuse → split spans with correct
-            attribution on each side of the cache-hit boundary.
-        """
-        # CI retries re-run only this method on the same server — restore
-        # fresh-server state first, or S1 hits the previous attempt's cache.
-        self._flush_cache()
-        self._set_weight_version("default")
-
-        # ── S1: fresh prompt, whole prompt computed under "default" ──
-        meta1 = self._generate(self.PROMPT_P1)
-        spans1 = meta1["prefill_weight_versions"]
-        print(f"[DEBUG] S1 prompt_tokens={meta1['prompt_tokens']}, spans={spans1}")
-        self.assertEqual(
-            spans1,
-            [{"version": "default", "start": 0, "end": meta1["prompt_tokens"]}],
-            f"S1: fresh prompt should be a single span, got {spans1}",
-        )
-
-        # ── S2: relabel, then reuse P1's cached prefix inside P2 ──
-        self._set_weight_version("v2")
-
-        meta2 = self._generate(self.PROMPT_P2)
-        spans2 = meta2["prefill_weight_versions"]
-        print(
-            f"[DEBUG] S2 cached_tokens={meta2['cached_tokens']}, "
-            f"prompt_tokens={meta2['prompt_tokens']}, spans={spans2}"
-        )
-        # cached_tokens (page-aligned prefix-match length) is the split point:
-        # reused "default" KV below it, freshly computed "v2" suffix above.
-        cached = meta2["cached_tokens"]
-        self.assertEqual(
-            spans2,
-            [
-                {"version": "default", "start": 0, "end": cached},
-                {
-                    "version": "v2",
-                    "start": cached,
-                    "end": meta2["prompt_tokens"],
-                },
-            ],
-            "S2: expected a stale 'default' span over the reused prefix "
-            f"(cached_tokens={cached}) followed by a 'v2' span over the rest",
-        )
-        # Output-side attribution rides along in the same response
-        self.assertEqual(meta2["weight_version"], "v2", "S2: active version")
-        self.assertEqual(
-            [span["version"] for span in meta2["weight_versions"]],
-            ["v2"],
-            f"S2: output tokens all generated under v2, got {meta2['weight_versions']}",
-        )
-
-
-if __name__ == "__main__":
-    unittest.main()
+--model-path
+--model
+--tokenizer-path
+--tokenizer-mode
+--tokenizer-backend
+--tokenizer-worker-num
+--detokenizer-worker-num
+--skip-tokenizer-init
+--load-format
+--model-loader-extra-config
+--trust-remote-code
+--context-length
+--is-embedding
+--enable-multimodal
+--revision
+--model-impl
+--model-config-parser
+--host
+--port
+--skip-server-warmup
+--warmups
+--nccl-port
+--fastapi-root-path
+--ssl-keyfile
+--ssl-certfile
+--ssl-keyfile-password
+--enable-ssl-refresh
+--enable-http2
+--dtype
+--quantization
+--kv-cache-dtype
+--enable-fp32-lm-head
+--mem-fraction-static
+--max-running-requests
+--prefill-max-requests
+--max-queued-requests
+--max-total-tokens
+--chunked-prefill-size
+--max-prefill-tokens
+--schedule-policy
+--enable-priority-scheduling
+--disable-priority-preemption
+--default-priority-value
+--schedule-low-priority-values-first
+--priority-scheduling-preemption-threshold
+--retraction-policy
+--schedule-conservativeness
+--page-size
+--swa-full-tokens-ratio
+--radix-eviction-policy
+--enable-prefill-delayer
+--prefill-delayer-max-delay-passes
+--prefill-delayer-token-usage-low-watermark
+--prefill-delayer-forward-passes-buckets
+--prefill-delayer-wait-seconds-buckets
+--prefill-delayer-queue-min-ratio
+--prefill-delayer-max-delay-ms
+--abort-on-priority-when-disabled
+--enable-dynamic-chunking
+--device
+--tensor-parallel-size
+--tp-size
+--pipeline-parallel-size
+--pp-size
+--attention-context-parallel-size
+--attn-cp-size
+--moe-data-parallel-size
+--moe-dp-size
+--pp-max-micro-batch-size
+--pp-async-batch-depth
+--stream-interval
+--batch-notify-size
+--incremental-streaming-output
+--stream-response-default-include-usage
+--enable-streaming-session
+--enable-session-radix-cache
+--random-seed
+--constrained-json-whitespace-pattern
+--constrained-json-disable-any-whitespace
+--watchdog-timeout
+--soft-watchdog-timeout
+--dist-timeout
+--download-dir
+--model-checksum
+--base-gpu-id
+--gpu-id-step
+--sleep-on-idle
+--load-snapshot-publish-interval
+--custom-sigquit-handler
+--log-level
+--log-level-http
+--log-requests
+--log-requests-level
+--log-requests-format
+--crash-dump-folder
+--enable-metrics
+--enable-mfu-metrics
+--enable-metrics-for-all-schedulers
+--tokenizer-metrics-custom-labels-header
+--tokenizer-metrics-allowed-custom-labels
+--extra-metric-labels
+--bucket-time-to-first-token
+--bucket-inter-token-latency
+--bucket-e2e-request-latency
+--prompt-tokens-buckets
+--generation-tokens-buckets
+--gc-warning-threshold-secs
+--decode-log-interval
+--enable-request-time-stats-logging
+--enable-forward-pass-metrics
+--forward-pass-metrics-worker-id
+--forward-pass-metrics-ipc-name
+--enable-trace
+--trace-modules
+--otlp-traces-endpoint
+--log-requests-target
+--uvicorn-access-log-exclude-prefixes
+--export-metrics-to-file
+--export-metrics-to-file-dir
+--api-key
+--admin-api-key
+--served-model-name
+--weight-version
+--chat-template
+--hf-chat-template-name
+--completion-template
+--enable-cache-report
+--reasoning-parser
+--default-chat-template-kwargs
+--strip-thinking-cache
+--enable-strict-thinking
+--tool-call-parser
+--sampling-defaults
+--asr-max-buffer-seconds
+--asr-max-concurrent-sessions
+--data-parallel-size
+--dp-size
+--load-balance-method
+--dist-init-addr
+--nccl-init-addr
+--nnodes
+--node-rank
+--json-model-override-args
+--preferred-sampling-params
+--enable-lora
+--enable-lora-overlap-loading
+--max-lora-rank
+--lora-target-modules
+--lora-paths
+--max-loras-per-batch
+--max-loaded-loras
+--lora-eviction-policy
+--lora-backend
+--experts-shared-outer-loras
+--lora-drain-wait-threshold
+--attention-backend
+--prefill-attention-backend
+--decode-attention-backend
+--sampling-backend
+--grammar-backend
+--radix-cache-backend
+--mm-attention-backend
+--speculative-algorithm
+--speculative-draft-model-path
+--speculative-draft-model
+--speculative-draft-model-revision
+--speculative-draft-load-format
+--speculative-num-steps
+--speculative-eagle-topk
+--speculative-num-draft-tokens
+--speculative-dflash-block-size
+--speculative-token-map
+--speculative-attention-mode
+--speculative-moe-runner-backend
+--speculative-moe-a2a-backend
+--speculative-draft-attention-backend
+--speculative-draft-model-quantization
+--speculative-adaptive
+--speculative-adaptive-config
+--expert-parallel-size
+--ep-size
+--ep
+--moe-a2a-backend
+--moe-runner-backend
+--deepep-mode
+--fuseep-mode
+--deepep-dispatcher-output-dtype
+--ep-num-redundant-experts
+--ep-dispatch-algorithm
+--init-expert-location
+--enable-eplb
+--eplb-algorithm
+--eplb-rebalance-num-iterations
+--eplb-rebalance-layers-per-chunk
+--eplb-min-rebalancing-utilization-threshold
+--expert-distribution-recorder-mode
+--expert-distribution-recorder-buffer-size
+--moe-dense-tp-size
+--enable-waterfill
+--max-mamba-cache-size
+--mamba-ssm-dtype
+--mamba-full-memory-ratio
+--mamba-radix-cache-strategy
+--mamba-track-interval
+--enable-hierarchical-cache
+--hicache-ratio
+--hicache-size
+--hicache-write-policy
+--hicache-io-backend
+--hicache-mem-layout
+--hicache-storage-backend
+--dllm-algorithm
+--dllm-algorithm-config
+--cpu-offload-gb
+--offload-group-size
+--offload-num-in-group
+--offload-prefetch-step
+--offload-mode
+--disable-radix-cache
+--cuda-graph-config
+--cuda-graph-backend-decode
+--cuda-graph-backend-prefill
+--cuda-graph-max-bs-decode
+--cuda-graph-max-bs-prefill
+--cuda-graph-bs-decode
+--cuda-graph-bs-prefill
+--disable-prefill-cuda-graph
+--disable-decode-cuda-graph
+--disable-cuda-graph-padding
+--enable-profile-cuda-graph
+--enable-cudagraph-gc
+--enable-tokenizer-batch-encode
+--disable-tokenizer-batch-decode
+--disable-custom-all-reduce
+--pre-warm-nccl
+--disable-overlap-schedule
+--enable-mixed-chunk
+--enable-dp-attention-local-control-broadcast
+--enable-dp-lm-head
+--delete-ckpt-after-loading
+--enable-memory-saver
+--enable-weights-cpu-backup
+--enable-draft-weights-cpu-backup
+--allow-auto-truncate
+--enable-custom-logit-processor
+--disable-shared-experts-fusion
+--disable-chunked-prefix-cache
+--image-processor-backend
+--enable-return-hidden-states
+--enable-return-routed-experts
+--scheduler-recv-interval
+--numa-node
+--enable-deterministic-inference
+--rl-on-policy-target
+--disable-attn-tp-gather
+--enable-prefill-cp
+--cp-strategy
+--enable-precise-embedding-interpolation
+--gc-threshold
+--enable-dynamic-batch-tokenizer
+--dynamic-batch-tokenizer-batch-size
+--dynamic-batch-tokenizer-batch-timeout
+--debug-tensor-dump-output-folder
+--debug-tensor-dump-layers
+--debug-tensor-dump-input-file
+--disaggregation-mode
+--disaggregation-transfer-backend
+--disaggregation-bootstrap-port
+--disaggregation-decode-enable-offload-kvcache
+--num-reserved-decode-tokens
+--disaggregation-decode-polling-interval
+--optimistic-prefill-attempts
+--enable-adaptive-dispatch-to-encoder
+--encoder-only
+--language-only
+--encoder-transfer-backend
+--encoder-urls
+--encoder-bootstrap-port
+--encoder-register-urls
+--custom-weight-loader
+--weight-loader-disable-mmap
+--weight-loader-prefetch-checkpoints
+--weight-loader-prefetch-num-threads
+--remote-instance-weight-loader-seed-instance-ip
+--remote-instance-weight-loader-seed-instance-service-port
+--remote-instance-weight-loader-send-weights-group-ports
+--remote-instance-weight-loader-backend
+--weight-loader-drop-cache-after-load
+--enable-broadcast-mm-inputs-process
+--mm-process-config
+--mm-enable-dp-encoder
+--mm-processor-worker-num
+--mm-io-worker-num
+--limit-mm-data-per-request
+--decrypted-config-file
+--decrypted-draft-config-file
+--enable-prefix-mm-cache
+--forward-hooks
+--enable-quant-communications
+--msprobe-dump-config
+--config
